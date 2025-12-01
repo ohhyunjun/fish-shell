@@ -56,6 +56,18 @@ fn main() {
     target.set_verbose(true);
     detect_cfgs(&mut target);
 
+    // 1. 시스템의 libcurl 라이브러리를 링크하라고 Rust에게 알림
+    println!("cargo:rustc-link-lib=curl");
+
+    // 2. 우리가 만든 C++ 파일들을 컴파일해서 'libfish_ai.a'라는 정적 라이브러리로 만듦
+    cc::Build::new()
+        .cpp(true)                  // C++ 모드 활성화
+        .std("c++17")               // C++17 표준 사용
+        .file("src/ai/ai_manager.cpp") // 소스 파일 1
+        .file("src/ai/ai_bridge.cpp")  // 소스 파일 2
+        .include("src/ai")          // 헤더 파일 경로
+        .compile("fish_ai");        // 컴파일 실행! (결과물 이름: libfish_ai.a)
+
     #[cfg(all(target_env = "gnu", target_feature = "crt-static"))]
     compile_error!(
         "Statically linking against glibc has unavoidable crashes and is unsupported. Use dynamic linking or link statically against musl."
