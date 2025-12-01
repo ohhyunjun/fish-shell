@@ -108,3 +108,6 @@ target/
 
 # AI slop
 .claude/
+*.key
+.env.fish
+api_key.txt
