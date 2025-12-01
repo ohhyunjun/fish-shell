@@ -163,6 +163,14 @@ use crate::wildcard::wildcard_has;
 use crate::wutil::{fstat, perror, write_to_fd, wstat};
 use crate::{abbrs, event, function};
 
+use std::ffi::{CStr, CString}; // 문자열 변환을 위해 필요
+
+extern "C" {
+    // C++ (ai_bridge.cpp)에 정의된 함수들
+    fn get_ai_suggestion_from_cpp(input: *const libc::c_char) -> *mut libc::c_char;
+    fn free_ai_suggestion(ptr: *mut libc::c_char);
+}
+
 /// A description of where fish is in the process of exiting.
 #[repr(u8)]
 enum ExitState {
@@ -720,6 +728,7 @@ pub struct ReaderData {
     /// If this is true, exit reader even if there are running jobs. This happens if we press e.g.
     /// ^D twice.
     did_warn_for_bg_jobs: bool,
+    
     /// The current contents of the top item in the kill ring.
     kill_item: WString,
 
@@ -5083,31 +5092,75 @@ impl<'a> Reader<'a> {
     }
 
     fn update_autosuggestion(&mut self) {
-        // If we can't autosuggest, just clear it.
+        // 1. 기본 조건 확인 (기존 코드)
         if !self.can_autosuggest() {
             self.data.in_flight_autosuggest_request.clear();
             self.data.autosuggestion.clear();
             return;
         }
 
+        // ========== [AI Co-pilot] AI 자동완성 시도 ==========
         let el = &self.data.command_line;
-        let autosuggestion = &self.autosuggestion;
-        if self.is_at_line_with_autosuggestion() {
-            assert!(string_prefixes_string_maybe_case_insensitive(
+        let input_text = el.text().to_string();
+        
+        // (디버깅용 로그: 필요 없으면 주석 처리하세요)
+        // eprintln!("[Rust] Input: '{}'", input_text);
+        
+        if !input_text.is_empty() {
+            if let Ok(c_input) = CString::new(input_text.clone()) {
+                unsafe {
+                    let ptr = get_ai_suggestion_from_cpp(c_input.as_ptr());
+                    
+                    if !ptr.is_null() {
+                        if let Ok(ai_text) = CStr::from_ptr(ptr).to_str() {
+                            // [수정 전] 엄격한 검사
+                            // if !ai_text.is_empty() && ai_text.starts_with(&input_text) {
+
+                            // [수정 후] 검문소 해제! (일단 무조건 보여줘)
+                            if !ai_text.is_empty() { 
+                                // 로그를 찍어서 AI가 뭐라고 했는지 확인
+                                eprintln!("[Rust] AI Raw Output: '{}'", ai_text);
+                                
+                                use crate::wchar::prelude::*;
+                                let ai_wstring = WString::from_str(ai_text);
+                                
+                                self.data.autosuggestion.clear();
+                                self.data.autosuggestion.text = ai_wstring;
+                                self.data.autosuggestion.search_string_range = 0..el.text().len(); // 범위 전체로 설정
+                                self.data.autosuggestion.icase = false;
+                                
+                                free_ai_suggestion(ptr);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // ========== [AI Co-pilot] 끝 ==========
+
+
+        // ========== 기존 fish-shell 로직 (AI 실패 시에만 실행됨) ==========
+        let el = &self.data.command_line;
+        let autosuggestion = &self.data.autosuggestion;
+        
+        // Check if our autosuggestion still applies.
+        if !autosuggestion.is_empty() && self.is_at_line_with_autosuggestion() {
+             if string_prefixes_string_maybe_case_insensitive(
                 autosuggestion.icase,
                 &el.text()[autosuggestion.search_string_range.clone()],
                 &autosuggestion.text
-            ));
-            return;
+            ) {
+                return;
+            }
+            self.data.autosuggestion.clear();
         }
 
-        // Do nothing if we've already kicked off this autosuggest request.
-        if el.text() == self.in_flight_autosuggest_request {
+        if el.text() == self.data.in_flight_autosuggest_request {
             return;
         }
         self.data.in_flight_autosuggest_request = el.text().to_owned();
 
-        // Clear the autosuggestion and kick it off in the background.
         FLOG!(reader_render, "Autosuggesting");
         self.data.autosuggestion.clear();
         let performer = get_autosuggestion_performer(
@@ -5125,6 +5178,7 @@ impl<'a> Reader<'a> {
         };
         debounce_autosuggestions().perform_with_completion(performer, completion);
     }
+
 
     fn is_at_end(&self) -> bool {
         let (_elt, el) = self.active_edit_line();
