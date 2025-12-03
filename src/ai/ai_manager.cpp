@@ -35,7 +35,15 @@ std::string AIManager::get_ai_suggestion(const std::string& current_input) {
         "Output ONLY the full command line. No explanations.";
     
     // 진짜 API 호출!
-    return call_gemini_api(prompt);
+    std::string result = call_gemini_api(prompt);
+
+    // ✅ 변경 사항 시작: 응답이 입력과 같으면 강제로 변경
+    if (result == current_input) {
+        result = current_input + " --help";
+    }
+    // ✅ 변경 사항 끝
+
+    return result;
 }
 // 3. 헬퍼 함수: libcurl 통신 로직
 std::string AIManager::call_gemini_api(const std::string& prompt) {

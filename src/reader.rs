@@ -746,6 +746,13 @@ pub struct ReaderData {
     in_flight_highlight_request: WString,
     in_flight_autosuggest_request: WString,
 
+    /// AI 제안
+    ai_suggestion: Option<WString>,
+    /// AI 팝업 표시 여부
+    ai_popup_visible: bool,
+    /// AI 모드 (1: 자동완성, 2: 설명, 3: 진단)
+    ai_mode: u8,
+
     rls: Option<ReadlineLoopState>,
 }
 
@@ -1368,6 +1375,9 @@ impl ReaderData {
             last_jump_precision: JumpPrecision::To,
             in_flight_highlight_request: Default::default(),
             in_flight_autosuggest_request: Default::default(),
+            ai_suggestion: None,
+            ai_popup_visible: false,
+            ai_mode: 1,
             rls: None,
         }))
     }
@@ -2853,6 +2863,10 @@ impl<'a> Reader<'a> {
                 event::fire_generic(self.parser, L!("fish_cancel").to_owned(), vec![]);
             }
             rl::Cancel => {
+                if self.data.ai_popup_visible {
+                    self.clear_ai_popup();
+                    return;
+                }
                 // If we last inserted a completion, undo it.
                 // This doesn't apply if the completion was selected via the pager
                 // (in which case the last command is "execute" or similar,
@@ -2904,6 +2918,19 @@ impl<'a> Reader<'a> {
                 self.parser.libdata_mut().is_repaint = false;
             }
             rl::Complete | rl::CompleteAndSearch => {
+                if let Some(ref ai_suggestion) = self.data.ai_suggestion {
+                    if self.data.ai_popup_visible {
+                        let text_to_insert = ai_suggestion.clone();
+                        let new_cursor_pos = text_to_insert.len(); // 커서를 문장 맨 끝으로 설정
+                        
+                        // push_edit 대신, 버퍼 전체를 안전하게 교체하는 함수 사용
+                        self.data.set_buffer_maintaining_pager(&text_to_insert, new_cursor_pos);
+                        
+                        self.clear_ai_popup();
+                        return;
+                    }
+                }
+                
                 if !self.conf.complete_ok {
                     return;
                 }
@@ -3580,11 +3607,7 @@ impl<'a> Reader<'a> {
                 }
             }
             rl::SuppressAutosuggestion => {
-                self.suppress_autosuggestion = true;
-                let success = self.is_at_line_with_autosuggestion();
-                self.autosuggestion.clear();
-                // Return true if we had a suggestion to clear.
-                self.input_data.function_set_status(success);
+                self.request_ai_suggestion(1);
             }
             rl::AcceptAutosuggestion => {
                 let success = self.is_at_line_with_autosuggestion();
@@ -4271,6 +4294,111 @@ impl<'a> Reader<'a> {
     /// Called to update the termsize, including $COLUMNS and $LINES, as necessary.
     fn update_termsize(&mut self) {
         termsize_update(self.parser);
+    }
+
+    /// AI 팝업 표시
+    fn show_ai_popup(&mut self, suggestion: &WString, mode: u8) {
+        self.data.ai_popup_visible = true;
+        
+        let mode_text = match mode {
+            1 => "AI",
+            2 => "설명",
+            3 => "진단",
+            _ => "AI",
+        };
+        
+        // 터미널 높이 가져오기 (reader.rs 상단에 use crate::termsize::termsize_last; 필요하지만 이미 있음)
+        let height = crate::termsize::termsize_last().height;
+        
+        // ANSI Escape Code 설명:
+        // \x1b7        : 현재 커서 위치 및 속성 저장 (Save Cursor)
+        // \x1b[{};1H   : 커서를 맨 하단 줄의 첫 번째 칸으로 이동
+        // \x1b[K       : 현재 줄 내용 지우기 (Clear Line)
+        // \x1b[44;37m  : 파란색 배경(44), 흰색 글자(37)
+        // \x1b[0m      : 색상 초기화
+        // \x1b8        : 저장했던 커서 위치로 복구 (Restore Cursor)
+        
+        let popup_text = format!(
+            "\x1b7\x1b[{};1H\x1b[K\x1b[44;37m [{}] {} \x1b[0m  (Tab: Accept | Esc: Dismiss)\x1b8",
+            height, mode_text, suggestion.to_string()
+        );
+        
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        let _ = write!(handle, "{}", popup_text); // writeln 대신 write 사용 (줄바꿈 방지)
+        let _ = handle.flush();
+    }
+
+    /// AI 팝업 제거
+    fn clear_ai_popup(&mut self) {
+        if self.data.ai_popup_visible {
+            self.data.ai_popup_visible = false;
+            self.data.ai_suggestion = None;
+
+            let height = crate::termsize::termsize_last().height;
+
+            // 커서 저장 -> 맨 하단 이동 -> 줄 지우기 -> 커서 복구
+            let clear_text = format!("\x1b7\x1b[{};1H\x1b[K\x1b8", height);
+
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            let _ = write!(handle, "{}", clear_text);
+            let _ = handle.flush();
+        }
+    }
+
+    /// AI 제안 요청 (모드별)
+    fn request_ai_suggestion(&mut self, mode: u8) {
+        let input_text = self.command_line.text().to_string();
+        
+        if input_text.is_empty() {
+            return;
+        }
+        
+        self.data.ai_mode = mode;
+        
+        use crate::wchar::prelude::*;
+        use std::ffi::{CString, CStr}; // CString, CStr이 필요할 수 있으니 안전하게 추가
+        
+        // 1. 여기서 'prompt_str' 변수를 먼저 정의해야 합니다!
+        let prompt_str = match mode {
+            1 => format!("Complete this shell command: '{}'. Fix typos if needed. Output ONLY the complete command, no explanations.", input_text),
+            2 => format!("Explain the options in command: '{}'. Be concise, one line per option.", input_text),
+            3 => format!("Diagnose issues with command: '{}'. Suggest fixes if problems found.", input_text),
+            _ => format!("Help with: '{}'", input_text),
+        };
+        
+        // 2. C++로 요청 보내기 (prompt_str의 '복제본'을 넘겨서 원본은 살려둡니다)
+        if let Ok(c_prompt) = CString::new(prompt_str.clone()) {
+            unsafe {
+                let ptr = get_ai_suggestion_from_cpp(c_prompt.as_ptr());
+                
+                if !ptr.is_null() {
+                    if let Ok(raw_response) = CStr::from_ptr(ptr).to_str() {
+                    
+                        // 3. 응답 처리: 이제 prompt_str 변수가 살아있으므로 에러가 나지 않습니다.
+                        let mut clean_response = raw_response.to_string();
+                        
+                        // 질문 내용이 답변 앞에 포함되어 있다면 잘라내기
+                        if clean_response.starts_with(&prompt_str) {
+                            clean_response = clean_response[prompt_str.len()..].to_string();
+                        }
+                        
+                        let clean_response = clean_response.trim();
+
+                        if !clean_response.is_empty() {
+                            let ai_wstring = WString::from_str(clean_response);
+                            self.data.ai_suggestion = Some(ai_wstring.clone());
+                            // 팝업 표시 함수 호출
+                            self.show_ai_popup(&ai_wstring, mode);
+                        }
+                    }
+                    free_ai_suggestion(ptr);
+                }
+            }
+        }
     }
 
     /// Flash the screen. This function changes the color of the current line momentarily.
@@ -5092,55 +5220,14 @@ impl<'a> Reader<'a> {
     }
 
     fn update_autosuggestion(&mut self) {
-        // 1. 기본 조건 확인 (기존 코드)
         if !self.can_autosuggest() {
             self.data.in_flight_autosuggest_request.clear();
             self.data.autosuggestion.clear();
+            self.data.ai_popup_visible = false;
+            self.data.ai_suggestion = None;
             return;
         }
 
-        // ========== [AI Co-pilot] AI 자동완성 시도 ==========
-        let el = &self.data.command_line;
-        let input_text = el.text().to_string();
-        
-        // (디버깅용 로그: 필요 없으면 주석 처리하세요)
-        // eprintln!("[Rust] Input: '{}'", input_text);
-        
-        if !input_text.is_empty() {
-            if let Ok(c_input) = CString::new(input_text.clone()) {
-                unsafe {
-                    let ptr = get_ai_suggestion_from_cpp(c_input.as_ptr());
-                    
-                    if !ptr.is_null() {
-                        if let Ok(ai_text) = CStr::from_ptr(ptr).to_str() {
-                            // [수정 전] 엄격한 검사
-                            // if !ai_text.is_empty() && ai_text.starts_with(&input_text) {
-
-                            // [수정 후] 검문소 해제! (일단 무조건 보여줘)
-                            if !ai_text.is_empty() { 
-                                // 로그를 찍어서 AI가 뭐라고 했는지 확인
-                                eprintln!("[Rust] AI Raw Output: '{}'", ai_text);
-                                
-                                use crate::wchar::prelude::*;
-                                let ai_wstring = WString::from_str(ai_text);
-                                
-                                self.data.autosuggestion.clear();
-                                self.data.autosuggestion.text = ai_wstring;
-                                self.data.autosuggestion.search_string_range = 0..el.text().len(); // 범위 전체로 설정
-                                self.data.autosuggestion.icase = false;
-                                
-                                free_ai_suggestion(ptr);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // ========== [AI Co-pilot] 끝 ==========
-
-
-        // ========== 기존 fish-shell 로직 (AI 실패 시에만 실행됨) ==========
         let el = &self.data.command_line;
         let autosuggestion = &self.data.autosuggestion;
         
