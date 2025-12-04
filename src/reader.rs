@@ -163,12 +163,20 @@ use crate::wildcard::wildcard_has;
 use crate::wutil::{fstat, perror, write_to_fd, wstat};
 use crate::{abbrs, event, function};
 
-use std::ffi::{CStr, CString}; // 문자열 변환을 위해 필요
-
+use std::ffi::CString;
 extern "C" {
-    // C++ (ai_bridge.cpp)에 정의된 함수들
     fn get_ai_suggestion_from_cpp(input: *const libc::c_char) -> *mut libc::c_char;
     fn free_ai_suggestion(ptr: *mut libc::c_char);
+    fn add_command_history_from_cpp(command: *const libc::c_char);
+    
+    // 순환 방식 함수
+    fn generate_ai_suggestions_from_cpp(input: *const libc::c_char);
+    fn next_ai_suggestion_from_cpp();
+    fn get_ai_suggestion_with_description_from_cpp() -> *mut libc::c_char;
+    fn get_ai_command_only_from_cpp() -> *mut libc::c_char;
+    fn has_ai_suggestions_from_cpp() -> bool;
+    fn clear_ai_suggestions_from_cpp();
+    fn is_same_input_from_cpp(input: *const libc::c_char) -> bool;
 }
 
 /// A description of where fish is in the process of exiting.
@@ -2918,22 +2926,16 @@ impl<'a> Reader<'a> {
                 self.parser.libdata_mut().is_repaint = false;
             }
             rl::Complete | rl::CompleteAndSearch => {
-                if let Some(ref ai_suggestion) = self.data.ai_suggestion {
-                    if self.data.ai_popup_visible {
-                        let text_to_insert = ai_suggestion.clone();
-                        let new_cursor_pos = text_to_insert.len(); // 커서를 문장 맨 끝으로 설정
-                        
-                        // push_edit 대신, 버퍼 전체를 안전하게 교체하는 함수 사용
-                        self.data.set_buffer_maintaining_pager(&text_to_insert, new_cursor_pos);
-                        
-                        self.clear_ai_popup();
-                        return;
-                    }
+                // AI 제안이 있으면 명령어만 적용
+                if self.data.ai_popup_visible {
+                    self.apply_ai_command();
+                    return;
                 }
                 
                 if !self.conf.complete_ok {
                     return;
                 }
+                
                 if self.is_navigating_pager_contents()
                     || (!self.rls().comp.is_empty()
                         && !self.rls().complete_did_insert
@@ -3607,7 +3609,7 @@ impl<'a> Reader<'a> {
                 }
             }
             rl::SuppressAutosuggestion => {
-                self.request_ai_suggestion(1);
+                self.request_or_cycle_ai_suggestion();
             }
             rl::AcceptAutosuggestion => {
                 let success = self.is_at_line_with_autosuggestion();
@@ -4350,53 +4352,106 @@ impl<'a> Reader<'a> {
     }
 
     /// AI 제안 요청 (모드별)
-    fn request_ai_suggestion(&mut self, mode: u8) {
+    fn request_ai_suggestion(&mut self, _mode: u8) {
         let input_text = self.command_line.text().to_string();
         
         if input_text.is_empty() {
             return;
         }
         
-        self.data.ai_mode = mode;
+        // mode 설정 (표시용)
+        self.data.ai_mode = _mode;
         
         use crate::wchar::prelude::*;
-        use std::ffi::{CString, CStr}; // CString, CStr이 필요할 수 있으니 안전하게 추가
+        use std::ffi::{CString, CStr};
         
-        // 1. 여기서 'prompt_str' 변수를 먼저 정의해야 합니다!
-        let prompt_str = match mode {
-            1 => format!("Complete this shell command: '{}'. Fix typos if needed. Output ONLY the complete command, no explanations.", input_text),
-            2 => format!("Explain the options in command: '{}'. Be concise, one line per option.", input_text),
-            3 => format!("Diagnose issues with command: '{}'. Suggest fixes if problems found.", input_text),
-            _ => format!("Help with: '{}'", input_text),
-        };
-        
-        // 2. C++로 요청 보내기 (prompt_str의 '복제본'을 넘겨서 원본은 살려둡니다)
-        if let Ok(c_prompt) = CString::new(prompt_str.clone()) {
+        // [수정] Rust에서는 불필요한 영어 문장("Complete this...")을 붙이지 않습니다.
+        // 사용자가 입력한 순수한 텍스트(예: "umask 파일 실행하려면?")만 C++로 보냅니다.
+        if let Ok(c_input) = CString::new(input_text) {
             unsafe {
-                let ptr = get_ai_suggestion_from_cpp(c_prompt.as_ptr());
+                // C++ 함수 호출 (순수 입력값 전달)
+                let ptr = get_ai_suggestion_from_cpp(c_input.as_ptr());
                 
                 if !ptr.is_null() {
                     if let Ok(raw_response) = CStr::from_ptr(ptr).to_str() {
-                    
-                        // 3. 응답 처리: 이제 prompt_str 변수가 살아있으므로 에러가 나지 않습니다.
-                        let mut clean_response = raw_response.to_string();
-                        
-                        // 질문 내용이 답변 앞에 포함되어 있다면 잘라내기
-                        if clean_response.starts_with(&prompt_str) {
-                            clean_response = clean_response[prompt_str.len()..].to_string();
-                        }
-                        
-                        let clean_response = clean_response.trim();
+                        // AI 응답 앞뒤 공백 제거
+                        let clean_response = raw_response.trim().to_string();
 
                         if !clean_response.is_empty() {
-                            let ai_wstring = WString::from_str(clean_response);
+                            let ai_wstring = WString::from_str(&clean_response);
                             self.data.ai_suggestion = Some(ai_wstring.clone());
-                            // 팝업 표시 함수 호출
-                            self.show_ai_popup(&ai_wstring, mode);
+                            // 팝업 표시
+                            self.show_ai_popup(&ai_wstring, _mode);
                         }
                     }
                     free_ai_suggestion(ptr);
                 }
+            }
+        }
+    }
+    /// Alt+W: AI 제안 생성 또는 다음 제안으로 순환
+    fn request_or_cycle_ai_suggestion(&mut self) {
+        use std::ffi::{CStr, CString};
+        
+        let input_text = self.command_line.text().to_string();
+        
+        if input_text.is_empty() {
+            return;
+        }
+        
+        unsafe {
+            // 입력이 바뀌었으면 기존 제안 초기화
+            if let Ok(c_input) = CString::new(input_text.clone()) {
+                if has_ai_suggestions_from_cpp() && !is_same_input_from_cpp(c_input.as_ptr()) {
+                    clear_ai_suggestions_from_cpp();
+                }
+            }
+            
+            // 이미 제안이 있으면 다음으로 순환
+            if has_ai_suggestions_from_cpp() {
+                next_ai_suggestion_from_cpp();
+            } else {
+                // 새로 생성
+                if let Ok(c_input) = CString::new(input_text) {
+                    generate_ai_suggestions_from_cpp(c_input.as_ptr());
+                }
+            }
+            
+            // 현재 제안 가져오기 (명령어 + 설명)
+            let ptr = get_ai_suggestion_with_description_from_cpp();
+            
+            if !ptr.is_null() {
+                if let Ok(suggestion_str) = CStr::from_ptr(ptr).to_str() {
+                    let suggestion = WString::from_str(suggestion_str);
+                    self.data.ai_suggestion = Some(suggestion.clone());
+                    self.data.ai_popup_visible = true;
+                    self.show_ai_popup(&suggestion, 1);
+                }
+                free_ai_suggestion(ptr);
+            }
+        }
+    }
+
+    /// Tab: 현재 제안의 명령어만 적용 (설명 제거)
+    fn apply_ai_command(&mut self) {
+        use std::ffi::CStr;
+        
+        if !self.data.ai_popup_visible {
+            return;
+        }
+        
+        unsafe {
+            let ptr = get_ai_command_only_from_cpp();
+            
+            if !ptr.is_null() {
+                if let Ok(command_str) = CStr::from_ptr(ptr).to_str() {
+                    let command = WString::from_str(command_str);
+                    
+                    // 명령어만 적용 (설명 제거됨!)
+                    self.set_buffer_maintaining_pager(&command, command.len());
+                    self.clear_ai_popup();
+                }
+                free_ai_suggestion(ptr);
             }
         }
     }
@@ -6131,6 +6186,13 @@ impl<'a> Reader<'a> {
         self.history.remove_ephemeral_items();
 
         if !text.is_empty() {
+            // C++ AI 매니저에 명령어 히스토리 전달
+            if let Ok(c_text) = CString::new(text.to_string()) {
+                unsafe {
+                    add_command_history_from_cpp(c_text.as_ptr());
+                }
+            }
+            
             // Mark this item as ephemeral if should_add_to_history says no (#615).
             let mode = if !self.should_add_to_history(&text) {
                 PersistenceMode::Ephemeral

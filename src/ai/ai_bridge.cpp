@@ -1,40 +1,63 @@
 #include "ai_manager.h"
-#include <cstring> // for strdup, malloc
-#include <iostream>
+#include <cstring>
 
-// Rust는 C++ 클래스를 직접 못 쓰므로, 
-// C 언어 스타일(extern "C")의 함수로 감싸서 내보냅니다.
+static AIManager g_manager;
+
 extern "C" {
 
-    // 1. Rust가 호출할 함수: AI 제안 가져오기
-    char* get_ai_suggestion_from_cpp(const char* input) {
-        // 입력값이 없으면 NULL 반환
-        if (input == nullptr) {
-            return nullptr;
-        }
-
-        // 정적(static) 객체로 관리하여 매번 키 설정을 다시 하지 않도록 함
-        static AIManager manager; 
-
-        // C++의 AI 엔진 호출!
-        std::string suggestion = manager.get_ai_suggestion(input);
-
-        // 결과가 비어있으면 NULL 반환
-        if (suggestion.empty()) {
-            return nullptr;
-        }
-
-        // [중요] C++ std::string을 C 스타일 문자열(char*)로 변환하여 복사
-        // Rust가 가져다 쓸 수 있도록 메모리를 새로 할당합니다.
-        char* result = strdup(suggestion.c_str());
-        return result;
+    // 새로운 제안 생성
+    void generate_ai_suggestions_from_cpp(const char* input) {
+        if (input == nullptr) return;
+        g_manager.generate_suggestions(input);
+    }
+    
+    // 다음 제안으로 순환
+    void next_ai_suggestion_from_cpp() {
+        g_manager.next_suggestion();
+    }
+    
+    // 현재 제안 (명령어 + 설명)
+    char* get_ai_suggestion_with_description_from_cpp() {
+        std::string suggestion = g_manager.get_current_suggestion_with_description();
+        if (suggestion.empty()) return nullptr;
+        return strdup(suggestion.c_str());
+    }
+    
+    // 현재 제안 (명령어만)
+    char* get_ai_command_only_from_cpp() {
+        std::string command = g_manager.get_current_command_only();
+        if (command.empty()) return nullptr;
+        return strdup(command.c_str());
+    }
+    
+    // 제안이 있는지 확인
+    bool has_ai_suggestions_from_cpp() {
+        return g_manager.has_suggestions();
+    }
+    
+    // 제안 초기화
+    void clear_ai_suggestions_from_cpp() {
+        g_manager.clear_suggestions();
+    }
+    
+    // 입력이 같은지 확인
+    bool is_same_input_from_cpp(const char* input) {
+        if (input == nullptr) return false;
+        return g_manager.is_same_input(input);
     }
 
-    // 2. Rust가 호출할 함수: 사용 끝난 메모리 해제
-    // Rust가 가져간 문자열은 C++이 할당한 것이므로, 해제도 C++이 해야 안전합니다.
+    // 히스토리 관리
+    void add_command_history_from_cpp(const char* command) {
+        if (command == nullptr) return;
+        g_manager.add_command_to_history(command);
+    }
+
+    void clear_command_history_from_cpp() {
+        g_manager.clear_history();
+    }
+
+    // 메모리 해제
     void free_ai_suggestion(char* ptr) {
-        if (ptr != nullptr) {
-            free(ptr);
-        }
+        if (ptr != nullptr) free(ptr);
     }
 }
