@@ -165,18 +165,17 @@ use crate::{abbrs, event, function};
 
 use std::ffi::CString;
 extern "C" {
-    fn get_ai_suggestion_from_cpp(input: *const libc::c_char) -> *mut libc::c_char;
-    fn free_ai_suggestion(ptr: *mut libc::c_char);
-    fn add_command_history_from_cpp(command: *const libc::c_char);
+    // [중요] C++의 generate_ai_suggestions_from_cpp 함수와 매칭
+    fn generate_ai_suggestions_from_cpp(input: *const libc::c_char, mode: libc::c_int);
     
-    // 순환 방식 함수
-    fn generate_ai_suggestions_from_cpp(input: *const libc::c_char);
     fn next_ai_suggestion_from_cpp();
     fn get_ai_suggestion_with_description_from_cpp() -> *mut libc::c_char;
     fn get_ai_command_only_from_cpp() -> *mut libc::c_char;
     fn has_ai_suggestions_from_cpp() -> bool;
     fn clear_ai_suggestions_from_cpp();
     fn is_same_input_from_cpp(input: *const libc::c_char) -> bool;
+    fn free_ai_suggestion(ptr: *mut libc::c_char);
+    fn add_command_history_from_cpp(command: *const libc::c_char);
 }
 
 /// A description of where fish is in the process of exiting.
@@ -2775,6 +2774,27 @@ impl<'a> Reader<'a> {
         #[allow(non_camel_case_types)]
         type rl = ReadlineCmd;
         match c {
+            // --- [1] AI 기능 바인딩 (여기는 유지) ---
+            rl::RepaintMode => {
+                 self.request_ai_suggestion(2); // Alt+Q
+            }
+            rl::ForceRepaint => {
+                 self.request_ai_suggestion(3); // Alt+R
+            }
+            rl::SuppressAutosuggestion => {
+                self.request_or_cycle_ai_suggestion(); // Alt+W
+            }
+            
+            // 원래의 Repaint 동작은 rl::Repaint가 담당하므로 위 두 개를 써도 안전함
+            rl::Repaint => {
+                self.queued_repaint = false;
+                self.parser.libdata_mut().is_repaint = true;
+                self.exec_prompt(true, false);
+                self.screen.reset_line(true);
+                self.layout_and_repaint(L!("readline"));
+                self.force_exec_prompt_and_repaint = false;
+                self.parser.libdata_mut().is_repaint = false;
+            }
             rl::BeginningOfLine => {
                 // Go to beginning of line.
                 loop {
@@ -2892,39 +2912,7 @@ impl<'a> Reader<'a> {
                     self.update_buff_pos(elt, None);
                 }
             }
-            rl::RepaintMode | rl::ForceRepaint | rl::Repaint => {
-                self.queued_repaint = false;
-                self.parser.libdata_mut().is_repaint = true;
-                if c == rl::RepaintMode {
-                    // Repaint the mode-prompt only if possible.
-                    // This is an optimization basically exclusively for vi-mode, since the prompt
-                    // may sometimes take a while but when switching the mode all we care about is the
-                    // mode-prompt.
-                    //
-                    // Because some users set `fish_mode_prompt` to an empty function and display the mode
-                    // elsewhere, we detect if the mode output is empty.
-
-                    // Don't go into an infinite loop of repainting.
-                    // This can happen e.g. if a variable triggers a repaint,
-                    // and the variable is set inside the prompt (#7324).
-                    // builtin commandline will refuse to enqueue these.
-                    self.exec_prompt(false, false);
-                    if !self.mode_prompt_buff.is_empty() {
-                        if self.is_repaint_needed(None) {
-                            self.screen.reset_line(/*repaint_prompt=*/ true);
-                            self.layout_and_repaint(L!("mode"));
-                        }
-                        self.parser.libdata_mut().is_repaint = false;
-                        return;
-                    }
-                    // Else we repaint as normal.
-                }
-                self.exec_prompt(true, false);
-                self.screen.reset_line(/*repaint_prompt=*/ true);
-                self.layout_and_repaint(L!("readline"));
-                self.force_exec_prompt_and_repaint = false;
-                self.parser.libdata_mut().is_repaint = false;
-            }
+            
             rl::Complete | rl::CompleteAndSearch => {
                 // AI 제안이 있으면 명령어만 적용
                 if self.data.ai_popup_visible {
@@ -3608,9 +3596,7 @@ impl<'a> Reader<'a> {
                     }
                 }
             }
-            rl::SuppressAutosuggestion => {
-                self.request_or_cycle_ai_suggestion();
-            }
+            
             rl::AcceptAutosuggestion => {
                 let success = self.is_at_line_with_autosuggestion();
                 if success {
@@ -4352,36 +4338,35 @@ impl<'a> Reader<'a> {
     }
 
     /// AI 제안 요청 (모드별)
-    fn request_ai_suggestion(&mut self, _mode: u8) {
+    fn request_ai_suggestion(&mut self, mode: u8) {
         let input_text = self.command_line.text().to_string();
         
         if input_text.is_empty() {
             return;
         }
         
-        // mode 설정 (표시용)
-        self.data.ai_mode = _mode;
+        self.data.ai_mode = mode;
         
         use crate::wchar::prelude::*;
         use std::ffi::{CString, CStr};
         
-        // [수정] Rust에서는 불필요한 영어 문장("Complete this...")을 붙이지 않습니다.
-        // 사용자가 입력한 순수한 텍스트(예: "umask 파일 실행하려면?")만 C++로 보냅니다.
         if let Ok(c_input) = CString::new(input_text) {
             unsafe {
-                // C++ 함수 호출 (순수 입력값 전달)
-                let ptr = get_ai_suggestion_from_cpp(c_input.as_ptr());
+                // [수정] 옛날 함수 대신 generate_... 호출 (모드 전달)
+                generate_ai_suggestions_from_cpp(c_input.as_ptr(), mode as i32);
+                
+                // [수정] 결과 가져오기
+                let ptr = get_ai_suggestion_with_description_from_cpp();
                 
                 if !ptr.is_null() {
                     if let Ok(raw_response) = CStr::from_ptr(ptr).to_str() {
-                        // AI 응답 앞뒤 공백 제거
                         let clean_response = raw_response.trim().to_string();
 
                         if !clean_response.is_empty() {
                             let ai_wstring = WString::from_str(&clean_response);
                             self.data.ai_suggestion = Some(ai_wstring.clone());
                             // 팝업 표시
-                            self.show_ai_popup(&ai_wstring, _mode);
+                            self.show_ai_popup(&ai_wstring, mode);
                         }
                     }
                     free_ai_suggestion(ptr);
@@ -4413,7 +4398,8 @@ impl<'a> Reader<'a> {
             } else {
                 // 새로 생성
                 if let Ok(c_input) = CString::new(input_text) {
-                    generate_ai_suggestions_from_cpp(c_input.as_ptr());
+                    // [수정] 모드 인자 '1' (GENERATION)을 추가로 전달합니다.
+                    generate_ai_suggestions_from_cpp(c_input.as_ptr(), 1); 
                 }
             }
             
